@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deforming Lines Visualizer</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: #eee; font-family: sans-serif; }
+        canvas { display: block; position: fixed; top: 0; left: 0; z-index: -1; } /* Keep canvas in background */
+
+        /* Left Controls Panel */
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0,0,0,0.7);
+            padding: 10px;
+            border-radius: 5px;
+            color: white;
+            z-index: 10; /* Ensure controls are above canvas */
+            max-width: 280px; /* Limit width */
+        }
+        #controls button {
+            background: #333;
+            border: 1px solid #555;
+            color: white;
+            padding: 5px 10px;
+            margin: 5px 0;
+            cursor: pointer;
+            border-radius: 3px;
+            display: inline-block; /* Align buttons */
+            margin-right: 5px;
+        }
+        #controls button:hover { background: #555; }
+        #audioPlayer { width: 100%; height: 40px; margin-top: 10px;}
+        #status { margin-top: 10px; font-size: 0.8em; color: #aaa; }
+
+        /* Drag & Drop Zone Styling */
+        #audioDropZone {
+            border: 2px dashed #555;
+            padding: 20px;
+            text-align: center;
+            border-radius: 5px;
+            margin-top: 15px;
+            cursor: pointer; /* Make it look clickable */
+            transition: background-color 0.2s, border-color 0.2s;
+        }
+        #audioDropZone.dragover {
+            background-color: rgba(255, 255, 255, 0.1);
+            border-color: #aaa;
+        }
+        #audioDropZone span {
+            display: block;
+            font-size: 0.9em;
+            color: #aaa;
+            pointer-events: none; /* Allow click/drop event to reach the zone */
+        }
+         #audioDropZone img {
+            margin: 0 auto 0.5rem auto; /* Center icon */
+            pointer-events: none;
+            opacity: 0.7;
+        }
+
+
+        /* Basic lil-gui positioning */
+        .lil-gui {
+            position: absolute !important; /* Ensure positioning */
+            top: 10px !important;
+            right: 10px !important;
+            z-index: 10; /* Ensure GUI is above canvas */
+        }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <h4>Audio Controls</h4>
+        <div>
+             <button id="playAudioButton">Play</button>
+             <button id="pauseAudioButton">Pause</button>
+        </div>
+        <audio id="audioPlayer" src="" controls></audio>
+
+        <div id="audioDropZone">
+            <img src="https://cdn.jsdelivr.net/npm/lucide-static@latest/icons/music.svg" alt="Audio" width="24" height="24" style="filter: invert(0.7);"/>
+            <span>Drag & Drop or Click to Browse</span>
+        </div>
+        <input type="file" id="audioFilePicker" accept="audio/*" style="display: none;">
+
+
+        <div id="status">Drop or select an audio file.</div>
+    </div>
+
+    <canvas id="visualizerCanvas"></canvas>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.163.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+        // --- Global Variables ---
+        let scene, camera, renderer, controls, clock, gui;
+        let points = []; // Array of THREE.Vector3 for FIXED circle points (Z=0)
+        let lineSegments, lineMaterial;
+        let pointMesh, pointMaterial;
+        let linePositions; // Buffer array for line vertices
+        let lineIndices = 0; // Index for filling line buffer
+
+        // Audio State
+        let audioContext; /* ... */ let analyser; /* ... */ let audioSource; /* ... */
+        let frequencyData; /* ... */ let audioElement; /* ... */ let isAudioSetup = false; /* ... */
+        let isAudioPlaying = false; /* ... */ const fftSize = 512; /* ... */
+
+        // --- Parameters ---
+        const parameters = {
+            // Visual Params
+            divisions: 150,
+            radius: 5, // Radius of the base circle
+            multiplier: 2,
+            curveSegments: 10, // *** NEW: Number of segments per curved line ***
+            lineWidth: 1.0,
+            lineColor: '#00ffff',
+            lineOpacity: 0.7,
+            showPoints: true,
+            pointSize: 0.05,
+            pointColor: '#ffffff',
+            // Fallback Animation Params
+            autoAnimateMultiplier: true,
+            autoMultiplierSpeed: 0.2,
+            // Audio Control Mode
+            audioControlMode: 'Single Target',
+            // Single Target Params
+            audioTargetParameter: 'Multiplier',
+            audioParamSource: 'Bass',
+            // Mapping Ranges
+            audioMultiplierMin: 2, audioMultiplierMax: 50,
+            audioRadiusMin: 4, audioRadiusMax: 8, // Can still control radius
+            audioOpacityMin: 0.2, audioOpacityMax: 1.0,
+            audioHueShiftMin: -0.1, audioHueShiftMax: 0.1,
+            // General Audio Params
+            audioSensitivity: 1.0,
+            audioSmoothing: 0.04,
+            // Internal state
+            _currentMultiplier: 2,
+            _currentRadius: 5, // Still used if audio targets radius
+            _currentLineOpacity: 0.7,
+            _currentHueShift: 0.0,
+            _baseLineHSL: { h: 0, s: 0, l: 0 },
+        };
+
+        // DOM Elements
+        const canvas = document.getElementById('visualizerCanvas'); /* ... */ const playButton = document.getElementById('playAudioButton'); /* ... */ const pauseButton = document.getElementById('pauseAudioButton'); /* ... */ const statusDiv = document.getElementById('status'); /* ... */ const audioDropZone = document.getElementById('audioDropZone'); /* ... */ const audioFilePicker = document.getElementById('audioFilePicker'); /* ... */ audioElement = document.getElementById('audioPlayer'); /* ... */
+
+        // --- Initialization ---
+        function init() {
+            scene = new THREE.Scene(); scene.background = new THREE.Color(0x111111); clock = new THREE.Clock(); camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000); camera.position.set(0, 0, 12); // Start view from top
+            renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true }); renderer.setSize(window.innerWidth, window.innerHeight);
+            controls = new OrbitControls(camera, renderer.domElement); controls.enableDamping = true; controls.dampingFactor = 0.05; controls.target.set(0, 0, 0);
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.4); scene.add(ambientLight); const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8); directionalLight.position.set(5, 10, 7.5); scene.add(directionalLight);
+
+            // Materials
+            lineMaterial = new THREE.LineBasicMaterial({ color: parameters.lineColor, linewidth: parameters.lineWidth, opacity: parameters.lineOpacity, transparent: true, depthWrite: false, vertexColors: false }); // No vertex colors needed now
+            pointMaterial = new THREE.PointsMaterial({ color: parameters.pointColor, size: parameters.pointSize, sizeAttenuation: true, transparent: true, opacity: 0.9, depthWrite: false });
+
+            // Initialize internal states
+            parameters._currentMultiplier = parameters.multiplier; parameters._currentRadius = parameters.radius; parameters._currentLineOpacity = parameters.lineOpacity; parameters._currentHueShift = 0.0; lineMaterial.color.getHSL(parameters._baseLineHSL);
+
+            // Initial Geometry Setup
+            createPoints(); // Creates points on 2D circle
+            createLineGeometry(); // Creates line buffer (size depends on curveSegments)
+            createPointGeometry(); // Creates point buffer using fixed points
+            updateLines(); // Populates line buffer initially
+
+            // GUI Setup
+            setupGUI();
+
+            // Event Listeners
+            window.addEventListener('resize', onWindowResize, false); playButton.addEventListener('click', playAudio, false); pauseButton.addEventListener('click', pauseAudio, false); audioElement.addEventListener('error', handleAudioElementError); setupAudioDropZoneAndPicker();
+
+            animate();
+        }
+
+        // --- Audio Handling (No changes needed here) ---
+        function setupAudioContext() { if (isAudioSetup) return true; try { if (!audioContext) { audioContext = new (window.AudioContext || window.webkitAudioContext)(); analyser = audioContext.createAnalyser(); analyser.fftSize = fftSize; const bufferLength = analyser.frequencyBinCount; frequencyData = new Uint8Array(bufferLength); console.log("AudioContext created."); } if (audioContext.state === 'suspended') { audioContext.resume().then(() => { console.log("AudioContext resumed."); isAudioSetup = true; }).catch(e => { throw e; }); } else { isAudioSetup = true; } if(statusDiv) statusDiv.textContent = "Audio ready."; return true; } catch (e) { console.error("Error setting up AudioContext:", e); if(statusDiv) statusDiv.textContent = "Error: Web Audio API setup failed."; isAudioSetup = false; return false; } }
+        function connectAudioSource() { if (!isAudioSetup || !audioContext || !analyser || !audioElement) return; if (!audioSource || audioSource.mediaElement !== audioElement) { try { if (audioSource) { try { audioSource.disconnect(); } catch(e) {} } audioSource = audioContext.createMediaElementSource(audioElement); audioSource.connect(analyser); analyser.connect(audioContext.destination); console.log("Audio source connected."); } catch (e) { console.error("Error connecting audio source:", e); if(statusDiv) statusDiv.textContent = "Error connecting audio."; audioSource = null; } } else { try { audioSource.disconnect(); } catch(e) {} try { audioSource.connect(analyser); analyser.connect(audioContext.destination); } catch(e) { console.error("Error reconnecting audio source:", e); } } }
+        function setupAudioDropZoneAndPicker() { audioDropZone.addEventListener('dragover', (event) => { event.preventDefault(); audioDropZone.classList.add('dragover'); }); audioDropZone.addEventListener('dragleave', () => { audioDropZone.classList.remove('dragover'); }); audioDropZone.addEventListener('drop', (event) => { event.preventDefault(); audioDropZone.classList.remove('dragover'); const files = event.dataTransfer.files; handleFileSelection(files); }); audioDropZone.addEventListener('click', () => { audioFilePicker.click(); }); audioFilePicker.addEventListener('change', (event) => { const files = event.target.files; handleFileSelection(files); event.target.value = null; }); }
+        function handleFileSelection(files) { if (files.length > 0) { const file = files[0]; if (file.type.startsWith('audio/')) { console.log("Audio file selected:", file.name); if (setupAudioContext()) { handleAudioFileProcessing(file); } else { if(statusDiv) statusDiv.textContent = "Audio Context failed."; } } else { if(statusDiv) statusDiv.textContent = "Selected file not audio."; } } }
+        function handleAudioFileProcessing(file) { if (!isAudioSetup) { console.error("Cannot handle audio file, AC not ready."); return; } pauseAudio(); if (audioElement.src && audioElement.src.startsWith('blob:')) { URL.revokeObjectURL(audioElement.src); console.log("Revoked previous Blob URL."); } const objectURL = URL.createObjectURL(file); audioElement.src = objectURL; audioElement.load(); if(statusDiv) statusDiv.textContent = `Loaded: ${file.name}. Press Play.`; connectAudioSource(); isAudioPlaying = false; }
+        function handleDroppedAudioFile(file) { handleAudioFileProcessing(file); }
+        function playAudio() { if (!isAudioSetup) { if (!setupAudioContext()) return; } if (audioContext.state === 'suspended') { audioContext.resume(); } if (!audioElement.src || audioElement.src === window.location.href || audioElement.src.startsWith('file://')) { if(statusDiv) statusDiv.textContent = "Error: No audio loaded."; return; } connectAudioSource(); if (!audioSource) { if(statusDiv) statusDiv.textContent = "Error: Audio source not connected."; return; } audioElement.play().then(() => { isAudioPlaying = true; if(statusDiv) statusDiv.textContent = "Playing..."; console.log("Playback started."); }).catch(e => { console.error("Error playing audio:", e); if(statusDiv) statusDiv.textContent = `Error playing: ${e.message}`; isAudioPlaying = false; }); }
+        function pauseAudio() { audioElement.pause(); isAudioPlaying = false; if(statusDiv) statusDiv.textContent = "Paused."; console.log("Playback paused."); }
+        function handleAudioElementError(e) { console.error("Audio Element Error:", audioElement.error); let errorMsg = "Error loading/playing audio."; if (audioElement.error) errorMsg = `Audio Error (Code: ${audioElement.error.code})`; if(statusDiv) statusDiv.textContent = errorMsg; isAudioPlaying = false; }
+
+
+        // --- Geometry Creation & Update ---
+         function createPoints() {
+            // *** CHANGE: Points are FIXED on 2D circle (Z=0) ***
+            points = [];
+            const divs = Math.max(1, parameters.divisions);
+            const angleStep = (2 * Math.PI) / divs;
+            const radiusToUse = parameters.radius; // Use base radius for point layout
+            for (let i = 0; i < divs; i++) {
+                const angle = i * angleStep;
+                const x = radiusToUse * Math.cos(angle);
+                const y = radiusToUse * Math.sin(angle);
+                points.push(new THREE.Vector3(x, y, 0)); // Z is always 0
+            }
+            console.log(`Created ${points.length} fixed points on 2D circle.`);
+            // Update point geometry if it exists
+            if (pointMesh) updatePointGeometryPositions(); // Use these fixed points
+            // Line geometry depends on segments, update/create it
+            createLineGeometry(); // Recreate line buffer based on new divisions/segments
+            updateLines(); // Populate lines
+        }
+
+        function createLineGeometry() {
+            // *** CHANGE: Buffer holds segments for curves ***
+            if (lineSegments) { scene.remove(lineSegments); lineSegments.geometry.dispose(); }
+            const divs = Math.max(1, parameters.divisions);
+            const segmentsPerCurve = Math.max(1, parameters.curveSegments);
+            const lineGeometry = new THREE.BufferGeometry();
+            // Each original connection = segmentsPerCurve small lines. Each small line = 2 vertices.
+            const totalVertices = divs * segmentsPerCurve * 2;
+            linePositions = new Float32Array(totalVertices * 3); // Allocate buffer
+            lineGeometry.setAttribute('position', new THREE.BufferAttribute(linePositions, 3));
+            lineGeometry.setDrawRange(0, 0); // Initially draw nothing
+            lineSegments = new THREE.LineSegments(lineGeometry, lineMaterial);
+            scene.add(lineSegments);
+            console.log(`Line buffer created for ${totalVertices} vertices.`);
+        }
+
+        function createPointGeometry() {
+            // *** CHANGE: Uses fixed points array ***
+            if (pointMesh) { scene.remove(pointMesh); pointMesh.geometry.dispose(); pointMesh = null; }
+            if (!parameters.showPoints || points.length === 0) return;
+            const pointGeometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(points.length * 3);
+            points.forEach((p, i) => { // Use fixed points array
+                if(p) { positions[i * 3] = p.x; positions[i * 3 + 1] = p.y; positions[i * 3 + 2] = p.z; }
+            });
+            pointGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            pointMesh = new THREE.Points(pointGeometry, pointMaterial);
+            scene.add(pointMesh);
+        }
+
+        function updateLines() {
+            // *** CHANGE: Generate curve segments and populate buffer ***
+            const divs = Math.max(1, parameters.divisions);
+            const segments = Math.max(1, parameters.curveSegments);
+            const numVerticesExpected = divs * segments * 2;
+
+             // Ensure geometry buffer is correctly sized
+             if (!lineSegments || !lineSegments.geometry.attributes.position || linePositions.length !== numVerticesExpected * 3) {
+                createLineGeometry(); // Recreate if divisions or segments changed
+                if (!lineSegments || !lineSegments.geometry.attributes.position || linePositions.length !== numVerticesExpected * 3) {
+                   console.warn("Line geometry not ready in updateLines (Curve)"); return;
+                }
+             }
+             // Ensure points are ready
+             if (points.length !== divs) {
+                 createPoints(); // Recalculate points if divisions changed
+                 if (points.length !== divs) {
+                     console.warn("Points not ready in updateLines"); return;
+                 }
+             }
+
+            lineIndices = 0; // Reset buffer index
+            const c = parameters._currentMultiplier;
+            const currentRadius = parameters.radius; // Use base radius for max arc height scaling
+            const diameter = currentRadius * 2;
+            const tempVec = new THREE.Vector3(); // For calculations
+
+            for (let x = 0; x < divs; x++) {
+                const y = ((Math.round(x * c) % divs) + divs) % divs;
+
+                const startPoint = points[x]; // Z=0
+                const endPoint = points[y];   // Z=0
+
+                if (startPoint && endPoint) {
+                    const dist2D = startPoint.distanceTo(endPoint);
+                    let maxZ = 0;
+                    if (diameter > 0.001) {
+                        maxZ = currentRadius * (dist2D / diameter); // Max arc height = radius * (chord/diameter)
+                    }
+                    const altSign = (x % 2 === 0 ? 1 : -1); // Alternate arc direction
+
+                    // Generate points along the curve
+                    let p1 = startPoint;
+                    for (let j = 1; j <= segments; j++) {
+                        const t = j / segments; // Progress along curve (0 to 1)
+                        // Interpolate position in XY plane
+                        tempVec.lerpVectors(startPoint, endPoint, t);
+                        // Calculate Z offset using sine curve for smooth arc
+                        const offsetZ = maxZ * Math.sin(t * Math.PI);
+                        tempVec.z = offsetZ * altSign;
+
+                        // Add segment (p1 -> tempVec) to buffer
+                        linePositions[lineIndices++] = p1.x;
+                        linePositions[lineIndices++] = p1.y;
+                        linePositions[lineIndices++] = p1.z;
+                        linePositions[lineIndices++] = tempVec.x;
+                        linePositions[lineIndices++] = tempVec.y;
+                        linePositions[lineIndices++] = tempVec.z;
+
+                        p1 = tempVec.clone(); // Next segment starts where this one ended
+                    }
+                } else {
+                    // Skip segments if points missing
+                    lineIndices += segments * 2 * 3;
+                }
+            }
+            // Update draw range
+            lineSegments.geometry.setDrawRange(0, lineIndices / 3);
+            lineSegments.geometry.attributes.position.needsUpdate = true;
+        }
+
+        function updatePointGeometryPositions() {
+            // *** CHANGE: Updates fixed points (only needed if radius/divisions change) ***
+            if (!pointMesh || !pointMesh.geometry.attributes.position || points.length === 0) return;
+            const positions = pointMesh.geometry.attributes.position.array;
+            // Ensure buffer size matches points length
+            if (positions.length !== points.length * 3) {
+                createPointGeometry(); // Recreate buffer if needed
+                return; // Exit because createPointGeometry populates it
+            }
+            // Populate buffer from fixed points array
+            const maxPoints = Math.min(points.length, positions.length / 3);
+            for(let i = 0; i < maxPoints; i++) {
+                const p = points[i];
+                if(p) { positions[i * 3] = p.x; positions[i * 3 + 1] = p.y; positions[i * 3 + 2] = p.z; }
+            }
+            pointMesh.geometry.attributes.position.needsUpdate = true;
+        }
+
+        function updatePointMarkersVisuals() {
+            // *** Uses fixed points, only needs update if showPoints changes ***
+            const divs = Math.max(1, parameters.divisions);
+            if (!parameters.showPoints) { if(pointMesh) pointMesh.visible = false; return; }
+            if(!pointMesh || points.length !== divs) { createPointGeometry(); if(!pointMesh) return; } // Recreate if needed
+            pointMesh.visible = true;
+            pointMaterial.size = parameters.pointSize;
+            pointMaterial.color.set(parameters.pointColor);
+            pointMaterial.opacity = parameters.lineOpacity;
+            // No need to update positions every frame as points are fixed
+            // updatePointGeometryPositions(); // Only needed if radius/divisions change, handled there
+        }
+
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            const deltaTime = clock.getDelta();
+            const time = clock.getElapsedTime();
+
+            let targetMultiplier = parameters.multiplier;
+            let targetRadius = parameters.radius;
+            let targetOpacity = parameters.lineOpacity;
+            let targetHueShift = 0.0;
+
+            const noAudioSourceLoaded = !audioElement.currentSrc;
+            let needsLineUpdate = false; // Flag to update lines only when needed
+
+            // --- Determine Targets (Audio / Fallback / Idle) ---
+            if (isAudioPlaying && isAudioSetup && analyser && frequencyData) {
+                // --- Audio Analysis ---
+                analyser.getByteFrequencyData(frequencyData);
+                // [ ... Same audio analysis code ... ]
+                const bufferLength = analyser.frequencyBinCount; const bassEndIndex = Math.floor(bufferLength * 0.1); const midStartIndex = bassEndIndex; const midEndIndex = Math.floor(bufferLength * 0.4); const trebleStartIndex = midEndIndex; let bassSum = 0, midSum = 0, trebleSum = 0, totalSum = 0; const needsBass = parameters.audioControlMode === 'Multi Target' || (parameters.audioControlMode === 'Single Target' && parameters.audioParamSource === 'Bass') || parameters.audioParamSource === 'Average'; const needsMid = parameters.audioControlMode === 'Multi Target' || (parameters.audioControlMode === 'Single Target' && parameters.audioParamSource === 'Mid') || parameters.audioParamSource === 'Average'; const needsTreble = parameters.audioControlMode === 'Multi Target' || (parameters.audioControlMode === 'Single Target' && parameters.audioParamSource === 'Treble') || parameters.audioParamSource === 'Average'; for (let i = 0; i < bufferLength; i++) { const value = frequencyData[i]; if (i < bassEndIndex && needsBass) bassSum += value; else if (i >= midStartIndex && i < midEndIndex && needsMid) midSum += value; else if (i >= trebleStartIndex && needsTreble) trebleSum += value; } totalSum = bassSum + midSum + trebleSum; const bassAvg = bassEndIndex > 0 ? (bassSum / bassEndIndex) : 0; const midAvg = (midEndIndex - midStartIndex > 0) ? (midSum / (midEndIndex - midStartIndex)) : 0; const trebleAvg = (bufferLength - trebleStartIndex > 0) ? (trebleSum / (bufferLength - trebleStartIndex)) : 0; if (parameters.audioParamSource === 'Average' || parameters.audioControlMode === 'Multi Target') { totalSum = 0; for(let i=0; i<bufferLength; i++) totalSum += frequencyData[i]; } const overallAvg = bufferLength > 0 ? (totalSum / bufferLength) : 0; const sensitivityFactor = Math.max(0.1, parameters.audioSensitivity);
+
+                // --- Apply Audio to Parameters based on Mode ---
+                if (parameters.audioControlMode === 'Single Target') {
+                    let drivingValue = 0; switch(parameters.audioParamSource) { case 'Bass': drivingValue = bassAvg; break; case 'Mid': drivingValue = midAvg; break; case 'Treble': drivingValue = trebleAvg; break; default: drivingValue = overallAvg; break; } const normalizedValue = drivingValue / 255.0; const scaledValue = Math.pow(normalizedValue, sensitivityFactor);
+                    switch(parameters.audioTargetParameter) {
+                        case 'Multiplier': targetMultiplier = mapValue(scaledValue, 0, 1, parameters.audioMultiplierMin, parameters.audioMultiplierMax); break;
+                        case 'Radius': targetRadius = mapValue(scaledValue, 0, 1, parameters.audioRadiusMin, parameters.audioRadiusMax); break;
+                        case 'Line Opacity': targetOpacity = mapValue(scaledValue, 0, 1, parameters.audioOpacityMin, parameters.audioOpacityMax); break;
+                        case 'Line Hue Shift': targetHueShift = mapValue(scaledValue, 0, 1, parameters.audioHueShiftMin, parameters.audioHueShiftMax); break;
+                    }
+                } else { // Multi Target Mode
+                    const normBass = bassAvg / 255.0; const scaledBass = Math.pow(normBass, sensitivityFactor); targetMultiplier = mapValue(scaledBass, 0, 1, parameters.audioMultiplierMin, parameters.audioMultiplierMax);
+                    const normMid = midAvg / 255.0; const scaledMid = Math.pow(normMid, sensitivityFactor); targetRadius = mapValue(scaledMid, 0, 1, parameters.audioRadiusMin, parameters.audioRadiusMax);
+                    const normTreble = trebleAvg / 255.0; const scaledTreble = Math.pow(normTreble, sensitivityFactor); targetHueShift = mapValue(scaledTreble, 0, 1, parameters.audioHueShiftMin, parameters.audioHueShiftMax);
+                }
+                needsLineUpdate = true; // Lines might change due to multiplier or radius change
+
+            } else if (noAudioSourceLoaded && parameters.autoAnimateMultiplier) {
+                // --- Fallback Animation ---
+                const sinValue = 0.5 + 0.5 * Math.sin(time * parameters.autoMultiplierSpeed); targetMultiplier = mapValue(sinValue, 0, 1, parameters.audioMultiplierMin, parameters.audioMultiplierMax);
+                targetRadius = parameters.radius; targetOpacity = parameters.lineOpacity; targetHueShift = 0.0;
+                needsLineUpdate = true; // Multiplier changes, so lines need update
+            } else {
+                // --- Audio Loaded but Paused or Fallback Disabled ---
+                targetMultiplier = parameters.multiplier; targetRadius = parameters.radius; targetOpacity = parameters.lineOpacity; targetHueShift = 0.0;
+                // Only update lines if multiplier or radius differs from current state
+                if (Math.abs(parameters._currentMultiplier - targetMultiplier) > 0.001 ||
+                    Math.abs(parameters._currentRadius - targetRadius) > 0.001) {
+                    needsLineUpdate = true;
+                }
+            }
+
+            // --- Smoothly Interpolate Internal State Towards Targets ---
+            const smoothing = parameters.audioSmoothing;
+            // Check if target actually changed before lerping (optimization?)
+            if (Math.abs(parameters._currentMultiplier - targetMultiplier) > 0.0001) {
+                parameters._currentMultiplier = lerp(parameters._currentMultiplier, targetMultiplier, smoothing);
+                needsLineUpdate = true; // Mark lines for update if multiplier changed
+            }
+            if (Math.abs(parameters._currentRadius - targetRadius) > 0.0001) {
+                parameters._currentRadius = lerp(parameters._currentRadius, targetRadius, smoothing);
+                // If radius changes, points need recalculation
+                parameters.radius = parameters._currentRadius; // Update base radius
+                createPoints(); // This will trigger updateLines via createPoints
+                needsLineUpdate = true; // Mark lines for update
+            }
+            if (Math.abs(parameters._currentLineOpacity - targetOpacity) > 0.001) {
+                parameters._currentLineOpacity = lerp(parameters._currentLineOpacity, targetOpacity, smoothing);
+            }
+            if (Math.abs(parameters._currentHueShift - targetHueShift) > 0.001) {
+                 parameters._currentHueShift = lerp(parameters._currentHueShift, targetHueShift, smoothing);
+            }
+
+
+            // --- Apply Final Parameters for Drawing ---
+            parameters.multiplier = parameters._currentMultiplier; // Update for GUI listen()
+            parameters.radius = parameters._currentRadius; // Update for GUI listen()
+
+            lineMaterial.opacity = parameters._currentLineOpacity;
+            pointMaterial.opacity = parameters._currentLineOpacity;
+
+            // Apply Hue Shift
+            const currentBaseColor = new THREE.Color(parameters.lineColor); currentBaseColor.getHSL(parameters._baseLineHSL); let shiftedHue = (parameters._baseLineHSL.h + parameters._currentHueShift) % 1.0; if (shiftedHue < 0) shiftedHue += 1.0; lineMaterial.color.setHSL(shiftedHue, parameters._baseLineHSL.s, parameters._baseLineHSL.l);
+
+            // Update visuals ONLY if needed
+            if (needsLineUpdate) {
+                updateLines(); // Uses _currentMultiplier and points array
+            }
+            updatePointMarkersVisuals(); // Uses fixed points, only updates visibility/style unless points recreated
+            renderer.render(scene, camera);
+
+             // Update GUI display
+             if (gui) { updateGUIListeningState(isAudioPlaying); }
+        }
+
+        // --- Helper Functions ---
+        function lerp(start, end, t) { return start * (1 - t) + end * t; }
+        function mapValue(value, inMin, inMax, outMin, outMax) { if (inMax - inMin === 0) return outMin; const clampedValue = Math.max(inMin, Math.min(value, inMax)); const normalized = (clampedValue - inMin) / (inMax - inMin); return normalized * (outMax - outMin) + outMin; }
+        function smoothStep(min, max, value) { const x = Math.max(0, Math.min(1, (value - min) / (max - min))); return x * x * (3 - 2 * x); }
+
+        // --- Event Handlers ---
+        function onWindowResize() { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); }
+
+        // --- GUI Setup ---
+        function setupGUI() {
+            if (gui) gui.destroy();
+            gui = new GUI();
+            gui.title("Controls");
+
+            const visFolder = gui.addFolder('Visuals');
+            visFolder.add(parameters, 'divisions', 10, 500, 1).name('Divisions').onChange(() => { createPoints(); createLineGeometry(); /* Point geom handled by createPoints */ updateLines(); });
+            visFolder.add(parameters, 'radius', 1, 20, 0.1).name('Base Radius').listen().onChange(v => { if(!isAudioPlaying) { parameters.radius = v; parameters._currentRadius = v; createPoints();} });
+            visFolder.add(parameters, '_currentMultiplier', 0, 200, 0.01).name('Multiplier').listen().onChange(v => { if (!isAudioPlaying && !parameters.autoAnimateMultiplier) { parameters.multiplier = v; parameters._currentMultiplier = v;} });
+            // *** NEW: Curve Segments Slider ***
+            visFolder.add(parameters, 'curveSegments', 1, 30, 1).name('Curve Smoothness').onChange(() => { createLineGeometry(); updateLines(); }); // Recreate buffer on change
+            visFolder.add(parameters, 'lineWidth', 0.1, 5, 0.1).name('Line Width').onChange(v => lineMaterial.linewidth = v);
+            visFolder.add(parameters, '_currentLineOpacity', 0, 1, 0.01).name('Line Opacity').listen().onChange(v => { if(!isAudioPlaying) { parameters.lineOpacity = v; parameters._currentLineOpacity = v;} });
+            visFolder.addColor(lineMaterial.color, 'getHexString').name('Line Color').listen().onChange(v => { if(!isAudioPlaying) { parameters.lineColor = v; lineMaterial.color.set(v); lineMaterial.color.getHSL(parameters._baseLineHSL);} });
+            visFolder.add(parameters, 'showPoints').name('Show Points').onChange(updatePointMarkersVisuals);
+            visFolder.add(parameters, 'pointSize', 0.01, 1, 0.005).name('Point Size').onChange(v => parameters.pointSize = v);
+            visFolder.addColor(parameters, 'pointColor').name('Point Color').onChange(v => parameters.pointColor = v);
+            visFolder.add(parameters, 'autoAnimateMultiplier').name('Auto Animate (No Audio)');
+            visFolder.add(parameters, 'autoMultiplierSpeed', 0.01, 1.0, 0.01).name('Auto Anim Speed');
+
+
+            const audioFolder = gui.addFolder('Audio Mapping');
+            audioFolder.add(parameters, 'audioControlMode', ['Single Target', 'Multi Target']).name('Control Mode');
+            audioFolder.add(parameters, 'audioTargetParameter', ['Multiplier', 'Radius', 'Line Opacity', 'Line Hue Shift']).name('Target Param (Single)');
+            audioFolder.add(parameters, 'audioParamSource', ['Bass', 'Mid', 'Treble', 'Average']).name('Audio Source (Single)');
+            audioFolder.add(parameters, 'audioMultiplierMin', 0, 50, 0.1).name('Mult Min');
+            audioFolder.add(parameters, 'audioMultiplierMax', 1, 200, 0.1).name('Mult Max');
+            audioFolder.add(parameters, 'audioRadiusMin', 1, 10, 0.1).name('Radius Min');
+            audioFolder.add(parameters, 'audioRadiusMax', 2, 20, 0.1).name('Radius Max');
+            audioFolder.add(parameters, 'audioOpacityMin', 0, 1, 0.01).name('Opacity Min');
+            audioFolder.add(parameters, 'audioOpacityMax', 0, 1, 0.01).name('Opacity Max');
+            audioFolder.add(parameters, 'audioHueShiftMin', -0.5, 0.5, 0.01).name('Hue Shift Min');
+            audioFolder.add(parameters, 'audioHueShiftMax', -0.5, 0.5, 0.01).name('Hue Shift Max');
+            audioFolder.add(parameters, 'audioSensitivity', 0.1, 5.0, 0.05).name('Sensitivity');
+            audioFolder.add(parameters, 'audioSmoothing', 0.01, 0.5, 0.005).name('Smoothing');
+
+
+            updateGUIListeningState(false); // Initial state
+        }
+
+        function updateGUIListeningState(isListening) {
+            if (!gui) return;
+            parameters.multiplier = parameters._currentMultiplier;
+            parameters.radius = parameters._currentRadius;
+            parameters.lineOpacity = parameters._currentLineOpacity;
+
+            gui.folders.forEach(folder => folder.controllers.forEach(c => {
+                if (c._listen) c.updateDisplay();
+            }));
+            gui.controllers.forEach(c => { if (c._listen) c.updateDisplay(); });
+        }
+
+        // --- Start ---
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+        } else {
+            init();
+        }
+    </script>
+</body>
+</html>
